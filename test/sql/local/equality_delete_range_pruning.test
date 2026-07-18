@@ -1,0 +1,56 @@
+# name: test/sql/local/equality_delete_range_pruning.test
+# description: Equality-delete range pruning preserves query results
+# group: [local]
+
+require avro
+
+require parquet
+
+require iceberg
+
+require httpfs
+
+statement ok
+SET iceberg_equality_delete_range_pruning = true;
+
+query III
+SELECT * FROM ICEBERG_SCAN('{WORKING_DIRECTORY}/data/persistent/equality_deletes/warehouse/mydb/mytable') ORDER BY ALL;
+----
+4	d	2025-01-04
+5	e	2025-01-05
+
+query III
+SELECT * FROM ICEBERG_SCAN('{WORKING_DIRECTORY}/data/persistent/equality_deletes/warehouse/mydb/mytable_partitioned') ORDER BY ALL;
+----
+1	a	2025-01-01
+4	d	2025-01-04
+5	e	2025-01-05
+
+query III
+SELECT * FROM ICEBERG_SCAN('{WORKING_DIRECTORY}/data/persistent/equality_deletes/warehouse/mydb/mytable_partitioned') WHERE name = 'a';
+----
+1	a	2025-01-01
+
+statement ok
+SET iceberg_equality_delete_range_pruning = false;
+
+query III
+SELECT * FROM ICEBERG_SCAN('{WORKING_DIRECTORY}/data/persistent/equality_deletes/warehouse/mydb/mytable') ORDER BY ALL;
+----
+4	d	2025-01-04
+5	e	2025-01-05
+
+query III
+SELECT * FROM ICEBERG_SCAN('{WORKING_DIRECTORY}/data/persistent/equality_deletes/warehouse/mydb/mytable_partitioned') ORDER BY ALL;
+----
+1	a	2025-01-01
+4	d	2025-01-04
+5	e	2025-01-05
+
+query III
+SELECT * FROM ICEBERG_SCAN('{WORKING_DIRECTORY}/data/persistent/equality_deletes/warehouse/mydb/mytable_partitioned') WHERE name = 'a';
+----
+1	a	2025-01-01
+
+statement ok
+SET iceberg_equality_delete_range_pruning = true;

@@ -45,6 +45,120 @@
 
 namespace duckdb {
 
+namespace {
+
+struct EqualityDeleteBoundsView {
+	const vector<int32_t> &equality_ids;
+	const unordered_map<int32_t, Value> &lower_bounds;
+	const unordered_map<int32_t, Value> &upper_bounds;
+	const unordered_map<int32_t, int64_t> &null_value_counts;
+	const unordered_map<int32_t, int64_t> &nan_value_counts;
+};
+
+static bool EqualityDeleteRangePruningEnabled(ClientContext &context) {
+	Value setting_value;
+	return !context.TryGetCurrentSetting("iceberg_equality_delete_range_pruning", setting_value) ||
+	       BooleanValue::Get(setting_value);
+}
+
+//! Returns true only when a partition mismatch is provable - any ambiguity must not prune
+static bool EqualityDeletePartitionProvablyMismatched(const IcebergTableMetadata &metadata,
+	                                                   int32_t delete_partition_spec_id,
+	                                                   const vector<IcebergPartitionInfo> &delete_partition_info,
+	                                                   int32_t data_partition_spec_id,
+	                                                   const vector<IcebergPartitionInfo> &data_partition_info) {
+	if (delete_partition_spec_id != data_partition_spec_id) {
+		return false;
+	}
+	auto spec_it = metadata.partition_specs.find(delete_partition_spec_id);
+	if (spec_it == metadata.partition_specs.end() || !spec_it->second.IsPartitioned()) {
+		return false;
+	}
+	if (delete_partition_info.size() != data_partition_info.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < delete_partition_info.size(); i++) {
+		auto &delete_field = delete_partition_info[i];
+		auto &data_field = data_partition_info[i];
+		if (delete_field.field_id != data_field.field_id) {
+			continue;
+		}
+		if (delete_field.value.IsNull() || data_field.value.IsNull()) {
+			continue;
+		}
+		if (delete_field.value != data_field.value) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! One provably disjoint equality field proves the whole delete entry cannot apply
+static bool EqualityDeleteBoundsAreDisjoint(const IcebergTableSchema &schema,
+	                                         const EqualityDeleteBoundsView &delete_bounds,
+	                                         const IcebergDataFile &data_file) {
+	for (auto field_id : delete_bounds.equality_ids) {
+		auto delete_null_count = delete_bounds.null_value_counts.find(field_id);
+		if (delete_null_count == delete_bounds.null_value_counts.end() || delete_null_count->second != 0) {
+			//! a NULL delete key can match NULL data values - require a known zero null count
+			continue;
+		}
+
+		auto delete_lower = delete_bounds.lower_bounds.find(field_id);
+		auto delete_upper = delete_bounds.upper_bounds.find(field_id);
+		auto data_lower = data_file.lower_bounds.find(field_id);
+		auto data_upper = data_file.upper_bounds.find(field_id);
+		if (delete_lower == delete_bounds.lower_bounds.end() || delete_upper == delete_bounds.upper_bounds.end() ||
+		    data_lower == data_file.lower_bounds.end() || data_upper == data_file.upper_bounds.end()) {
+			continue;
+		}
+
+		auto column_index = schema.TryGetColumnIndexByFieldId(field_id);
+		if (!column_index) {
+			continue;
+		}
+		auto &column = IcebergTableSchema::GetFromColumnIndex(schema.columns, *column_index, 0);
+		if (column.type.id() == LogicalTypeId::FLOAT || column.type.id() == LogicalTypeId::DOUBLE) {
+			auto delete_nan_count = delete_bounds.nan_value_counts.find(field_id);
+			if (delete_nan_count == delete_bounds.nan_value_counts.end() || delete_nan_count->second != 0) {
+				//! manifest bounds exclude NaNs - require a known zero NaN count
+				continue;
+			}
+		}
+
+		try {
+			auto delete_stats = IcebergPredicateStats::DeserializeBounds(
+			    delete_lower->second, delete_upper->second, column.name, column.type);
+			auto data_stats = IcebergPredicateStats::DeserializeBounds(data_lower->second, data_upper->second,
+			                                                          column.name, column.type);
+			if (!delete_stats.lower_bound || !delete_stats.upper_bound || !data_stats.lower_bound ||
+			    !data_stats.upper_bound || delete_stats.lower_bound->IsNull() ||
+			    delete_stats.upper_bound->IsNull() || data_stats.lower_bound->IsNull() ||
+			    data_stats.upper_bound->IsNull()) {
+				continue;
+			}
+			if (*delete_stats.upper_bound < *data_stats.lower_bound ||
+			    *delete_stats.lower_bound > *data_stats.upper_bound) {
+				return true;
+			}
+		} catch (Exception &) {
+			continue;
+		}
+	}
+	return false;
+}
+
+static EqualityDeleteBoundsView GetEqualityDeleteBounds(const IcebergDataFile &delete_file) {
+	return {delete_file.equality_ids, delete_file.lower_bounds, delete_file.upper_bounds,
+	        delete_file.null_value_counts, delete_file.nan_value_counts};
+}
+
+static EqualityDeleteBoundsView GetEqualityDeleteBounds(const IcebergEqualityDeleteFile &delete_file) {
+	return GetEqualityDeleteBounds(delete_file.manifest_data_file.get());
+}
+
+} // namespace
+
 void ManifestEntryReadState::PushBatch(ManifestReadBatch &&batch) {
 	lock_guard<mutex> guard(lock);
 	batches.push_back(std::move(batch));
@@ -1276,6 +1390,10 @@ IcebergMultiFileList::GetEqualityDeletesForFile(const BoundIcebergManifestEntry 
 					}
 				}
 			}
+			if (EqualityDeleteRangePruningEnabled(context) &&
+			    EqualityDeleteBoundsAreDisjoint(GetSchema(), GetEqualityDeleteBounds(file), data_file)) {
+				continue;
+			}
 			result.emplace_back(file);
 		}
 	}
@@ -1491,17 +1609,46 @@ void IcebergMultiFileList::EnumerateDeleteManifestEntriesInternal() const {
 	}
 
 	shared_state->delete_entries_enumerated = true;
+	shared_state->delete_manifest_entries_scanned.resize(shared_state->delete_manifest_entries.size(), false);
 	D_ASSERT(FinishedScanningDeletes());
 }
 
 void IcebergMultiFileList::ScanDeleteFiles(const vector<MultiFileColumnDefinition> &global_columns,
                                            const vector<ColumnIndex> &global_column_ids,
                                            const vector<idx_t> &projection_ids) const {
-	for (; shared_state->next_delete_entry_to_process < shared_state->delete_manifest_entries.size();
-	     shared_state->next_delete_entry_to_process++) {
-		auto &bound_manifest_entry = shared_state->delete_manifest_entries[shared_state->next_delete_entry_to_process];
+	const bool range_pruning_enabled = EqualityDeleteRangePruningEnabled(context);
+	for (idx_t delete_idx = 0; delete_idx < shared_state->delete_manifest_entries.size(); delete_idx++) {
+		if (shared_state->delete_manifest_entries_scanned[delete_idx]) {
+			continue;
+		}
+		auto &bound_manifest_entry = shared_state->delete_manifest_entries[delete_idx];
 		auto &manifest_entry = bound_manifest_entry.entry;
 		auto &data_file = manifest_entry.data_file;
+		if (range_pruning_enabled && data_file.content == IcebergManifestEntryContentType::EQUALITY_DELETES) {
+			auto &delete_manifest_file =
+			    GetManifestFileForEntry(bound_manifest_entry, IcebergManifestContentType::DELETE);
+			bool applies_to_scan = false;
+			for (auto &data_entry : data_manifest_entries) {
+				auto &data_manifest_file = GetManifestFileForEntry(data_entry, IcebergManifestContentType::DATA);
+				if (manifest_entry.GetSequenceNumber(delete_manifest_file) <=
+				    data_entry.entry.GetSequenceNumber(data_manifest_file)) {
+					continue;
+				}
+				if (EqualityDeletePartitionProvablyMismatched(
+				        GetMetadata(), delete_manifest_file.partition_spec_id, data_file.partition_info,
+				        data_manifest_file.partition_spec_id, data_entry.entry.data_file.partition_info)) {
+					continue;
+				}
+				if (!EqualityDeleteBoundsAreDisjoint(GetSchema(), GetEqualityDeleteBounds(data_file),
+				                                      data_entry.entry.data_file)) {
+					applies_to_scan = true;
+					break;
+				}
+			}
+			if (!applies_to_scan) {
+				continue;
+			}
+		}
 		if (StringUtil::CIEquals(data_file.file_format, "parquet")) {
 			ScanDeleteFile(bound_manifest_entry, global_columns, global_column_ids, projection_ids);
 		} else if (StringUtil::CIEquals(data_file.file_format, "puffin")) {
@@ -1511,6 +1658,7 @@ void IcebergMultiFileList::ScanDeleteFiles(const vector<MultiFileColumnDefinitio
 			    "File format '%s' not supported for deletes, only supports 'parquet' and 'puffin' currently",
 			    data_file.file_format);
 		}
+		shared_state->delete_manifest_entries_scanned[delete_idx] = true;
 	}
 }
 
@@ -1519,8 +1667,31 @@ void IcebergMultiFileList::ProcessDeletes(const vector<MultiFileColumnDefinition
                                           const vector<idx_t> &projection_ids) const {
 	lock_guard<mutex> guard(shared_state->lock);
 	InitializeFiles(guard);
+	if (delete_files_processed) {
+		return;
+	}
+	if (EqualityDeleteRangePruningEnabled(context)) {
+		bool has_equality_delete_entries = false;
+		{
+			lock_guard<mutex> delete_guard(shared_state->delete_lock);
+			EnumerateDeleteManifestEntriesInternal();
+			for (auto &entry : shared_state->delete_manifest_entries) {
+				if (entry.entry.data_file.content == IcebergManifestEntryContentType::EQUALITY_DELETES) {
+					has_equality_delete_entries = true;
+					break;
+				}
+			}
+		}
+		if (has_equality_delete_entries) {
+			idx_t file_idx = data_manifest_entries.size();
+			while (GetDataFile(file_idx, guard)) {
+				file_idx++;
+			}
+		}
+	}
 	lock_guard<mutex> delete_guard(shared_state->delete_lock);
 	ProcessDeletesInternal(global_columns, global_column_ids, projection_ids);
+	delete_files_processed = true;
 }
 
 void IcebergMultiFileList::ProcessDeletesInternal(const vector<MultiFileColumnDefinition> &global_columns,

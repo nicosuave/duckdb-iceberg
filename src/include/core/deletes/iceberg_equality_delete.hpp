@@ -31,8 +31,10 @@ public:
 
 struct IcebergEqualityDeleteFile {
 public:
-	IcebergEqualityDeleteFile(vector<IcebergPartitionInfo> partition_info_p, int32_t partition_spec_id)
-	    : partition_info(std::move(partition_info_p)), partition_spec_id(partition_spec_id) {
+	IcebergEqualityDeleteFile(vector<IcebergPartitionInfo> partition_info_p, int32_t partition_spec_id,
+	                          const IcebergDataFile &manifest_data_file_p)
+	    : partition_info(std::move(partition_info_p)), partition_spec_id(partition_spec_id),
+	      manifest_data_file(manifest_data_file_p) {
 	}
 	IcebergEqualityDeleteFile(const IcebergEqualityDeleteFile &) = delete;
 	IcebergEqualityDeleteFile &operator=(const IcebergEqualityDeleteFile &) = delete;
@@ -43,6 +45,8 @@ public:
 	//! The partition info if the equality delete has partition information
 	vector<IcebergPartitionInfo> partition_info;
 	int32_t partition_spec_id;
+	//! Manifest statistics used to prove that this delete file cannot match a data file.
+	reference<const IcebergDataFile> manifest_data_file;
 	//! Raw equality delete values, keyed by Iceberg field-id. These are converted to bound expressions once the
 	//! scan output projection is known.
 	unordered_map<int32_t, vector<Value>> equality_values;

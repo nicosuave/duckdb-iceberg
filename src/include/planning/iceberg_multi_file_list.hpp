@@ -115,8 +115,8 @@ private:
 	mutable unique_ptr<AvroScan> delete_manifest_scan;
 	mutable unique_ptr<manifest_file::ManifestReader> delete_manifest_reader;
 	mutable bool delete_entries_enumerated = false;
-	mutable idx_t next_delete_entry_to_process = 0;
 	mutable vector<BoundIcebergManifestEntry> delete_manifest_entries;
+	mutable vector<bool> delete_manifest_entries_scanned;
 
 	//! Scanned data manifests and their owners.
 	mutable vector<IcebergManifestListEntry> committed_data_manifests;
@@ -251,6 +251,7 @@ private:
 	//! Combination of committed + transaction delete manifests
 	mutable vector<BoundIcebergManifestListEntry> delete_manifests;
 	mutable vector<bool> delete_manifest_matches;
+	mutable bool delete_files_processed = false;
 
 private:
 	//! Set by the table function's set_scan_order callback when an ORDER BY ... LIMIT can drive scan order.
