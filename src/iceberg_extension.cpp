@@ -44,10 +44,22 @@ public:
 	}
 };
 
+// Prefer statically linked dependencies, which AutoLoadExtension cannot resolve after a sqllogictest restart.
+static void LoadRequiredExtension(DatabaseInstance &instance, const char *name) {
+	if (instance.ExtensionIsLoaded(name)) {
+		return;
+	}
+	DuckDB db_wrapper(instance);
+	if (ExtensionHelper::LoadExtension(db_wrapper, name) == ExtensionLoadResult::LOADED_EXTENSION) {
+		return;
+	}
+	ExtensionHelper::AutoLoadExtension(instance, name);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
-	ExtensionHelper::AutoLoadExtension(instance, "parquet");
-	ExtensionHelper::AutoLoadExtension(instance, "avro");
+	LoadRequiredExtension(instance, "parquet");
+	LoadRequiredExtension(instance, "avro");
 
 	if (!instance.ExtensionIsLoaded("parquet")) {
 		throw MissingExtensionException("The iceberg extension requires the parquet extension to be loaded!");
