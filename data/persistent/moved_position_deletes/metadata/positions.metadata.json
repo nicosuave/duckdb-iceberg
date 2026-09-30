@@ -1,0 +1,81 @@
+{
+  "format-version": 3,
+  "table-uuid": "686ee8de-6752-4608-9699-81267ec5c60e",
+  "location": "/tmp/old_location/default/deletion_vectors",
+  "last-sequence-number": 2,
+  "last-updated-ms": 1789295323844,
+  "last-column-id": 1,
+  "current-schema-id": 0,
+  "schemas": [
+    {
+      "type": "struct",
+      "schema-id": 0,
+      "fields": [
+        {
+          "id": 1,
+          "name": "col",
+          "required": false,
+          "type": "long"
+        }
+      ]
+    }
+  ],
+  "default-spec-id": 0,
+  "partition-specs": [
+    {
+      "spec-id": 0,
+      "fields": []
+    }
+  ],
+  "last-partition-id": 999,
+  "default-sort-order-id": 0,
+  "sort-orders": [
+    {
+      "order-id": 0,
+      "fields": []
+    }
+  ],
+  "properties": {
+    "write.delete.format": "puffin",
+    "owner": "edaurd",
+    "write.update.mode": "merge-on-read",
+    "write.delete.mode": "merge-on-read",
+    "write.parquet.compression-codec": "zstd"
+  },
+  "current-snapshot-id": 4703959501299342508,
+  "next-row-id": 100,
+  "refs": {
+    "main": {
+      "snapshot-id": 4703959501299342508,
+      "type": "branch"
+    }
+  },
+  "snapshots": [
+    {
+      "sequence-number": 2,
+      "snapshot-id": 4703959501299342508,
+      "parent-snapshot-id": 4002122163070166396,
+      "timestamp-ms": 1789295323844,
+      "summary": {
+        "operation": "delete",
+        "total-records": "100",
+        "total-data-files": "1",
+        "total-delete-files": "1",
+        "total-position-deletes": "2"
+      },
+      "manifest-list": "/tmp/old_location/default/deletion_vectors/metadata/positions-list.avro",
+      "schema-id": 0,
+      "first-row-id": 100,
+      "added-rows": 0
+    }
+  ],
+  "statistics": [],
+  "partition-statistics": [],
+  "snapshot-log": [
+    {
+      "timestamp-ms": 1789295323844,
+      "snapshot-id": 4703959501299342508
+    }
+  ],
+  "metadata-log": []
+}

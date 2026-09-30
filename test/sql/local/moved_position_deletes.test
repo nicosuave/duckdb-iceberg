@@ -1,0 +1,35 @@
+# name: test/sql/local/moved_position_deletes.test
+# description: Moved positional paths and v3 deletion-vector supersession
+# group: [local]
+
+include test/sql/init_requires
+
+# The original paths in the manifest and positional delete rows point at
+# /tmp/old_location, whereas the actual files live in this persistent fixture.
+query II
+select count(*), sum(col) from iceberg_scan(
+ '{WORKING_DIRECTORY}/data/persistent/moved_position_deletes', version='positions', allow_moved_paths=true);
+----
+98	4900
+
+query I
+select count(*) from iceberg_scan(
+ '{WORKING_DIRECTORY}/data/persistent/moved_position_deletes', version='positions', allow_moved_paths=true)
+where col in (0, 50);
+----
+0
+
+# The live v3 vector deletes row 0 and supersedes the older positional content;
+# row 50 must survive even though the selected Parquet delete file contains it.
+query II
+select count(*), sum(col) from iceberg_scan(
+ '{WORKING_DIRECTORY}/data/persistent/moved_position_deletes', version='mixed', allow_moved_paths=true);
+----
+99	4950
+
+query I
+select col from iceberg_scan(
+ '{WORKING_DIRECTORY}/data/persistent/moved_position_deletes', version='mixed', allow_moved_paths=true)
+where col in (0, 50);
+----
+50

@@ -29,6 +29,9 @@ struct IcebergDeleteExecutionContext {
 //! Execution state for one delete file. This deliberately lives outside scan
 //! planning: it caches the result of reading the selected delete descriptor.
 struct IcebergDeleteFileLoadState {
+	//! Set only for a Parquet positional load covering this original data-file path.
+	//! An unset path means the complete descriptor was read.
+	optional<string> data_file_path;
 	mutex lock;
 	std::condition_variable cv;
 	bool complete = false;
@@ -75,6 +78,7 @@ private:
 	//! Assembled task results retained for DELETE/UPDATE, never used to filter another task.
 	position_delete_map_t positional_delete_data;
 	//! File identities select buckets; complete descriptors retain scan semantics.
+	//! A positional descriptor has at most one path-specific load and one full load.
 	unordered_map<IcebergFileIdentity, vector<pair<IcebergDeleteFile, shared_ptr<IcebergDeleteFileLoadState>>>,
 	              IcebergFileIdentityHash>
 	    descriptor_loads;

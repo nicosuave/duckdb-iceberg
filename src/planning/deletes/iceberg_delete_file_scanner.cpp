@@ -12,6 +12,9 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "function/iceberg_functions.hpp"
 #include "iceberg_logging.hpp"
 #include "iceberg_options.hpp"
@@ -127,20 +130,25 @@ static void ScanPositionalDeleteFile(const IcebergDeleteExecutionContext &contex
 	reference<const string_t> current_file_path = names[0];
 	auto initial_key = current_file_path.get().GetString();
 	auto &positional_delete_data = scan_entry.load->positional_deletes;
-	auto deletes = TryGetOrCreatePositionDeletes(positional_delete_data, data_file.file_path, initial_key);
-	DUCKDB_LOG(context.context, IcebergLogType,
-	           "Iceberg Delete Scan, read 'positional_delete_file': '%s', referencing 'data_file': '%s'",
-	           data_file.file_path, initial_key);
+	auto select_path = [&](const string &key) {
+		// Keep exact matching here as well as in the pushed Parquet predicate.
+		// Paths inside delete files are original Iceberg paths, even for moved tables.
+		if (scan_entry.load->data_file_path && *scan_entry.load->data_file_path != key) {
+			return optional_ptr<IcebergPositionalDeleteData>();
+		}
+		DUCKDB_LOG(context.context, IcebergLogType,
+		           "Iceberg Delete Scan, read 'positional_delete_file': '%s', referencing 'data_file': '%s'",
+		           data_file.file_path, key);
+		return TryGetOrCreatePositionDeletes(positional_delete_data, data_file.file_path, key);
+	};
+	auto deletes = select_path(initial_key);
 
 	for (idx_t i = 0; i < result.size(); i++) {
 		auto &name = names[i];
 		if (name != current_file_path.get()) {
 			current_file_path = name;
 			auto key = current_file_path.get().GetString();
-			DUCKDB_LOG(context.context, IcebergLogType,
-			           "Iceberg Delete Scan, read 'positional_delete_file': '%s', referencing 'data_file': '%s'",
-			           data_file.file_path, key);
-			deletes = TryGetOrCreatePositionDeletes(positional_delete_data, data_file.file_path, key);
+			deletes = select_path(key);
 		}
 		if (deletes) {
 			deletes->AddRow(row_ids[i]);
@@ -317,7 +325,16 @@ static void ScanParquetDeleteFiles(const IcebergDeleteExecutionContext &context,
 	for (idx_t i = 0; i < return_types.size(); i++) {
 		column_ids.push_back(i);
 	}
-	TableFunctionInitInput input(bind_data.get(), column_ids, vector<idx_t>(), nullptr);
+	TableFilterSet filters;
+	auto &target_path = scan_entries[0].get().load->data_file_path;
+	if (content == IcebergManifestEntryContentType::POSITION_DELETES && target_path) {
+		auto comparison = BoundComparisonExpression::Create(
+		    ExpressionType::COMPARE_EQUAL, make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0ULL),
+		    make_uniq<BoundConstantExpression>(Value(*target_path)));
+		filters.PushFilter(ProjectionIndex(0), make_uniq<ExpressionFilter>(std::move(comparison)));
+	}
+	TableFunctionInitInput input(bind_data.get(), column_ids, vector<idx_t>(),
+	                             filters.HasFilters() ? &filters : nullptr);
 	auto global_state = delete_scan_function.init_global(context.context, input);
 	auto local_state = delete_scan_function.init_local(execution_context, input, global_state.get());
 	auto &multi_file_local_state = local_state->Cast<MultiFileLocalState>();
@@ -363,13 +380,18 @@ IcebergDeleteScanResult IcebergDeleteFileScanner::ScanFiles(const IcebergDeleteE
                                                             const vector<IcebergDeleteScanEntry> &entries) {
 	IcebergDeleteScanResult result;
 	vector<reference<const IcebergDeleteScanEntry>> positional_delete_entries;
+	map<string, vector<reference<const IcebergDeleteScanEntry>>> filtered_positional_delete_entries;
 	vector<reference<const IcebergDeleteScanEntry>> equality_delete_entries;
 	for (auto &scan_entry : entries) {
 		auto &data_file = scan_entry.file;
 		if (StringUtil::CIEquals(data_file.file_format, "parquet")) {
 			switch (data_file.content) {
 			case IcebergManifestEntryContentType::POSITION_DELETES:
-				positional_delete_entries.emplace_back(scan_entry);
+				if (scan_entry.load->data_file_path) {
+					filtered_positional_delete_entries[*scan_entry.load->data_file_path].emplace_back(scan_entry);
+				} else {
+					positional_delete_entries.emplace_back(scan_entry);
+				}
 				break;
 			case IcebergManifestEntryContentType::EQUALITY_DELETES:
 				equality_delete_entries.emplace_back(scan_entry);
@@ -388,6 +410,9 @@ IcebergDeleteScanResult IcebergDeleteFileScanner::ScanFiles(const IcebergDeleteE
 	}
 	ScanParquetDeleteFiles(context, positional_delete_entries, IcebergManifestEntryContentType::POSITION_DELETES,
 	                       result);
+	for (auto &entry : filtered_positional_delete_entries) {
+		ScanParquetDeleteFiles(context, entry.second, IcebergManifestEntryContentType::POSITION_DELETES, result);
+	}
 	ScanParquetDeleteFiles(context, equality_delete_entries, IcebergManifestEntryContentType::EQUALITY_DELETES, result);
 	return result;
 }
@@ -427,15 +452,34 @@ IcebergDeletePlan IcebergDeleteExecutionState::ProcessDeletes(const IcebergDelet
 		unordered_set<IcebergDeleteFileLoadState *> seen;
 		for (auto &descriptor : descriptors) {
 			shared_ptr<IcebergDeleteFileLoadState> load;
+			optional<string> target_path;
+			if (descriptor.content == IcebergManifestEntryContentType::POSITION_DELETES &&
+			    StringUtil::CIEquals(descriptor.file_format, "parquet") &&
+			    descriptor.record_count > STANDARD_VECTOR_SIZE) {
+				// Cache files fitting one decode vector completely. Selective loading
+				// would save at most one vector but can require a second scan when a
+				// different data path needs the same descriptor.
+				target_path = data_file_path;
+			}
+			bool has_partial_load = false;
 			auto &bucket = descriptor_loads[{descriptor.file_path, descriptor.content_offset}];
 			for (auto &entry : bucket) {
 				if (entry.first == descriptor) {
-					load = entry.second;
-					break;
+					if (!entry.second->data_file_path || entry.second->data_file_path == target_path) {
+						load = entry.second;
+						break;
+					}
+					has_partial_load = true;
 				}
 			}
 			if (!load) {
 				load = make_shared_ptr<IcebergDeleteFileLoadState>();
+				// A selective query reads only its path. If another path needs this
+				// descriptor, promote to a full shared load instead of rescanning it
+				// once per data file. At most two reads occur, even across workers.
+				if (!has_partial_load) {
+					load->data_file_path = std::move(target_path);
+				}
 				bucket.emplace_back(descriptor, load);
 				new_loads.push_back(load);
 				scan_entries.push_back({descriptor, load});

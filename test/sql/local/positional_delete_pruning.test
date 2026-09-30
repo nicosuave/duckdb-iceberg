@@ -1,0 +1,246 @@
+# name: test/sql/local/positional_delete_pruning.test
+# description: Selective positional reads and bounded shared-descriptor promotion
+# group: [local]
+
+include test/sql/init_requires
+
+require json
+
+require vector_size 2048
+
+statement ok
+set enable_external_file_cache=false;
+
+statement ok
+copy (select i::integer id from range(4) t(i)) to '{TEST_DIR}/pruning_unmatched.parquet'
+(format parquet, field_ids {id:1});
+
+statement ok
+create temp table tasks as select
+ '{TEST_DIR}/pruning_unmatched.parquet'::varchar file_path,
+ 'PARQUET'::varchar file_format,
+ (select size from read_blob('{TEST_DIR}/pruning_unmatched.parquet'))::bigint file_size_in_bytes,
+ 4::bigint record_count, NULL::bigint sequence_number, NULL::bigint first_row_id,
+ 0::integer partition_spec_id, {'1':NULL::integer} partition_constants,
+ []::struct(file_path varchar, file_format varchar, content integer, file_size_in_bytes bigint,
+            record_count bigint, equality_ids integer[], referenced_data_file varchar,
+            content_offset bigint, content_size_in_bytes bigint)[] delete_files,
+ NULL::bigint snapshot_id, 0::integer schema_id,
+ '{"format-version":2,"table-uuid":"00000000-0000-0000-0000-000000000002","location":"{TEST_DIR}","last-updated-ms":0,"last-column-id":1,"last-sequence-number":0,"current-schema-id":0,"schemas":[{"schema-id":0,"type":"struct","fields":[{"id":1,"name":"id","required":false,"type":"int"}]}],"partition-specs":[{"spec-id":0,"fields":[]}],"default-spec-id":0,"sort-orders":[{"order-id":0,"fields":[]}],"default-sort-order-id":0}'::json::variant metadata,
+ NULL::struct(id integer) schema;
+
+statement ok
+create macro delete_descriptor(path, kind, ids, rows) as
+ {'file_path':path::varchar, 'file_format':'PARQUET'::varchar, 'content':kind::integer,
+  'file_size_in_bytes':(select size::bigint from read_blob(path)), 'record_count':rows::bigint,
+  'equality_ids':ids::integer[], 'referenced_data_file':NULL::varchar,
+  'content_offset':NULL::bigint, 'content_size_in_bytes':NULL::bigint};
+
+# A shared positional file has one row group per data path. Repeated positions
+# also exercise duplicate deletes within the filtered and promoted full loads.
+foreach suffix a b c
+
+statement ok
+copy (select i::integer id from range(4096) t(i)) to '{TEST_DIR}/shared_{suffix}.parquet'
+(format parquet, field_ids {id:1});
+
+endloop
+
+statement ok
+copy (select '{TEST_DIR}/shared_' || suffix || '.parquet' as file_path, (i%2)::bigint pos
+      from (values ('a'), ('b'), ('c')) p(suffix), range(2048) t(i) order by file_path, pos)
+to '{TEST_DIR}/shared_positions.parquet'
+(format parquet, row_group_size 2048, field_ids {file_path:2147483546, pos:2147483545});
+
+statement ok
+create temp table shared_position_tasks as
+select t.* replace('{TEST_DIR}/shared_' || suffix || '.parquet' as file_path,
+ (select size from read_blob('{TEST_DIR}/shared_a.parquet'))::bigint as file_size_in_bytes,
+ 4096::bigint as record_count,
+ [delete_descriptor('{TEST_DIR}/shared_positions.parquet', 1, [], 6144)] as delete_files)
+from tasks t, (values ('a'), ('b'), ('c')) p(suffix);
+
+statement ok
+call enable_logging(['Iceberg', 'ParquetPrefetch', 'FileSystem']);
+
+statement ok
+set threads=1;
+
+statement ok
+set variable selective_positions = (select list(t) from shared_position_tasks t where file_path like '%shared_b.parquet');
+
+statement ok
+call truncate_duckdb_logs();
+
+query II
+select count(*), sum(id) from iceberg_scan_tasks(getvariable('selective_positions'));
+----
+4094	8386559
+
+# Only the matching path is materialized. The other two row groups are pruned
+# by statistics before evaluation, so only one row group produces a prefetch log.
+query I
+select count(distinct message) from duckdb_logs
+where type='Iceberg' and message like 'Iceberg Delete Scan, read ''positional_delete_file''%';
+----
+1
+
+query I
+select count(*)
+from duckdb_logs_parsed('ParquetPrefetch') where file_path like '%shared_positions.parquet';
+----
+1
+
+# An empty path-specific result cannot be mistaken for an empty full descriptor.
+statement ok
+set variable initially_empty_positions = (select list(t) from (
+ select * replace([delete_descriptor('{TEST_DIR}/shared_positions.parquet', 1, [], 6144)] as delete_files) from tasks
+ union all select * from shared_position_tasks) t);
+
+query II
+select count(*), sum(id) from iceberg_scan_tasks(getvariable('initially_empty_positions'));
+----
+12286	25159683
+
+foreach ordering asc desc
+
+loop threads 1 5
+
+statement ok
+set threads={threads};
+
+statement ok
+pragma verify_parallelism;
+
+# Many concurrent consumers share the first path load and the promoted full
+# descriptor. Reversing task order changes which path gets the partial load.
+statement ok
+set variable shared_positions = (select list(t order by file_path {ordering}) from
+ (select p.* replace(list_concat(delete_files, delete_files) as delete_files)
+  from shared_position_tasks p, range(17)) t);
+
+statement ok
+call truncate_duckdb_logs();
+
+query II
+select count(*), sum(id) from iceberg_scan_tasks(getvariable('shared_positions'));
+----
+208794	427714509
+
+# One path is materialized twice (selective + full), the other two once. In
+# particular, a full-table scan must not re-read this descriptor for every task.
+query I
+select count(*) from duckdb_logs
+where type='Iceberg' and message like 'Iceberg Delete Scan, read ''positional_delete_file''%';
+----
+4
+
+endloop
+
+endloop
+
+# A broad descriptor list should read small files once, even if the first task
+# references another path. Cover one-row descriptors and the one-vector budget.
+foreach delete_rows 1 2048
+
+foreach suffix a b c
+
+statement ok
+copy (select '{TEST_DIR}/shared_{suffix}.parquet' as file_path, 0::bigint pos from range({delete_rows}))
+to '{TEST_DIR}/tiny_positions_{delete_rows}_{suffix}.parquet'
+(format parquet, field_ids {file_path:2147483546, pos:2147483545});
+
+endloop
+
+statement ok
+create or replace temp table tiny_position_tasks as select * replace([
+ delete_descriptor('{TEST_DIR}/tiny_positions_{delete_rows}_a.parquet', 1, [], {delete_rows}),
+ delete_descriptor('{TEST_DIR}/tiny_positions_{delete_rows}_b.parquet', 1, [], {delete_rows}),
+ delete_descriptor('{TEST_DIR}/tiny_positions_{delete_rows}_c.parquet', 1, [], {delete_rows})
+] as delete_files) from shared_position_tasks;
+
+foreach ordering asc desc
+
+foreach threads 1 4
+
+statement ok
+set threads={threads};
+
+statement ok
+set variable tiny_positions = (select list(t order by file_path {ordering}) from
+ (select p.* replace(list_concat(delete_files, delete_files) as delete_files)
+  from tiny_position_tasks p, range(17)) t);
+
+statement ok
+call truncate_duckdb_logs();
+
+query II
+select count(*), sum(id) from iceberg_scan_tasks(getvariable('tiny_positions'));
+----
+208845	427714560
+
+# A Parquet load opens a metadata handle and a data-scan handle. Count both,
+# including loads returning no matches, to catch repeated partial/full setup.
+query III
+with opens as (
+ select path, count(*) as n from duckdb_logs_parsed('FileSystem')
+ where op='OPEN' and path like '%tiny_positions_{delete_rows}_%.parquet' group by path
+)
+select count(*), min(n), max(n) from opens;
+----
+3	2	2
+
+endloop
+
+endloop
+
+endloop
+
+# Just beyond one vector, keep selective materialization for a shared file.
+statement ok
+copy (select '{TEST_DIR}/shared_' || chr(97+(i%3)::integer) || '.parquet' as file_path, 0::bigint pos
+      from range(2049) t(i) order by file_path)
+to '{TEST_DIR}/boundary_positions.parquet'
+(format parquet, field_ids {file_path:2147483546, pos:2147483545});
+
+statement ok
+set variable boundary_positions = (select list(t) from (
+ select * replace([delete_descriptor('{TEST_DIR}/boundary_positions.parquet', 1, [], 2049)] as delete_files)
+ from shared_position_tasks where file_path like '%shared_b.parquet') t);
+
+statement ok
+call truncate_duckdb_logs();
+
+query II
+select count(*), sum(id) from iceberg_scan_tasks(getvariable('boundary_positions'));
+----
+4095	8386560
+
+query I
+select count(distinct message) from duckdb_logs
+where type='Iceberg' and message like 'Iceberg Delete Scan, read ''positional_delete_file''%';
+----
+1
+
+statement ok
+call disable_logging();
+
+# Failures in path-specific/full builders must wake their concurrent consumers.
+foreach duplicate_rows 1 2048
+
+statement ok
+copy (select file_path, 'invalid position'::varchar pos from shared_position_tasks, range({duplicate_rows}))
+to '{TEST_DIR}/invalid_shared_positions_{duplicate_rows}.parquet'
+(format parquet, field_ids {file_path:2147483546, pos:2147483545});
+
+statement ok
+set variable invalid_shared_positions = (select list(t) from (
+ select p.* replace([delete_descriptor('{TEST_DIR}/invalid_shared_positions_{duplicate_rows}.parquet', 1, [], 3*{duplicate_rows})] as delete_files)
+ from shared_position_tasks p, range(17)) t);
+
+statement error
+select count(*) from iceberg_scan_tasks(getvariable('invalid_shared_positions'));
+----
+pos
+
+endloop
