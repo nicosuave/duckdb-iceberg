@@ -351,7 +351,9 @@ IcebergScanPlanner::ResolveApplicableDeleteFiles(const BoundIcebergManifestEntry
 	annotated_lock_guard<annotated_mutex> guard(shared_state->lock);
 	auto delete_context = GetDeletePlanningContext();
 	auto partition_values = IcebergFilePruner::PartitionValueMap(data_manifest_entry.entry.data_file);
-	for (auto delete_file : provider->GetDeleteFiles(manifest_indexes)) {
+	for (auto delete_file :
+	     provider->GetDeleteFiles(manifest_indexes, data_manifest_entry.entry,
+	                              data_manifests[data_manifest_entry.manifest_file_idx].entry.file)) {
 		if (delete_file.manifest_idx >= delete_manifests.size()) {
 			throw InternalException("Delete manifest index %llu is out of bounds for %llu manifests",
 			                        delete_file.manifest_idx, delete_manifests.size());

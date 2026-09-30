@@ -21,7 +21,10 @@ void ServerSideScanPlanProvider::StartDataManifestScan(const vector<bool> &match
 	}
 }
 
-vector<IcebergDeleteFileReference> ServerSideScanPlanProvider::GetDeleteFiles(const vector<idx_t> &manifest_indexes) {
+vector<IcebergDeleteFileReference>
+ServerSideScanPlanProvider::GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+                                           const IcebergManifestEntry &data_entry,
+                                           const IcebergManifestFile &data_manifest) {
 	vector<IcebergDeleteFileReference> result;
 	for (auto manifest_idx : manifest_indexes) {
 		if (manifest_idx >= plan.delete_manifests.size()) {

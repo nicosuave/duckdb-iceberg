@@ -20,8 +20,11 @@ void ClientSideScanPlanProvider::ReadDeleteManifests(const vector<idx_t> &manife
 	store.ReadDeleteManifests(manifest_indexes, filter_count);
 }
 
-vector<IcebergDeleteFileReference> ClientSideScanPlanProvider::GetDeleteFiles(const vector<idx_t> &manifest_indexes) {
-	return store.GetDeleteFiles(manifest_indexes);
+vector<IcebergDeleteFileReference>
+ClientSideScanPlanProvider::GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+                                           const IcebergManifestEntry &data_entry,
+                                           const IcebergManifestFile &data_manifest) {
+	return store.GetDeleteFiles(manifest_indexes, data_entry, data_manifest);
 }
 
 bool ClientSideScanPlanProvider::TryGetNextBatch(IcebergDataViewCursor &cursor) {

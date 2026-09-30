@@ -27,7 +27,9 @@ public:
 	virtual void LoadManifestList() = 0;
 	virtual void StartDataManifestScan(const vector<bool> &matching_manifests, idx_t filter_count) = 0;
 	virtual void ReadDeleteManifests(const vector<idx_t> &manifest_indexes, idx_t filter_count) = 0;
-	virtual vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes) = 0;
+	virtual vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+	                                                          const IcebergManifestEntry &data_entry,
+	                                                          const IcebergManifestFile &data_manifest) = 0;
 	virtual bool TryGetNextBatch(IcebergDataViewCursor &cursor) = 0;
 	virtual void FinishScanTasks() = 0;
 	virtual bool DeleteFileAppliesToDataFile(const string &data_file_path,
@@ -50,7 +52,9 @@ public:
 	void StartDataManifestScan(const vector<bool> &matching_manifests, idx_t filter_count) override
 	    DUCKDB_REQUIRES(store.lock);
 	void ReadDeleteManifests(const vector<idx_t> &manifest_indexes, idx_t filter_count) override;
-	vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes) override
+	vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+	                                                  const IcebergManifestEntry &data_entry,
+	                                                  const IcebergManifestFile &data_manifest) override
 	    DUCKDB_REQUIRES(store.lock);
 	bool TryGetNextBatch(IcebergDataViewCursor &cursor) override DUCKDB_REQUIRES(store.lock);
 	void FinishScanTasks() override DUCKDB_REQUIRES(store.lock);
@@ -73,7 +77,9 @@ public:
 	void LoadManifestList() override;
 	void StartDataManifestScan(const vector<bool> &matching_manifests, idx_t filter_count) override;
 	void ReadDeleteManifests(const vector<idx_t> &manifest_indexes, idx_t filter_count) override;
-	vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes) override;
+	vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+	                                                  const IcebergManifestEntry &data_entry,
+	                                                  const IcebergManifestFile &data_manifest) override;
 	bool TryGetNextBatch(IcebergDataViewCursor &cursor) override;
 	void FinishScanTasks() override;
 	bool DeleteFileAppliesToDataFile(const string &data_file_path,

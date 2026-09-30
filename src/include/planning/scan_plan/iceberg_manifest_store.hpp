@@ -8,6 +8,7 @@ namespace duckdb {
 
 struct IcebergManifestScanningState;
 struct IcebergDeleteManifestLoadState;
+struct IcebergDeleteManifestIndex;
 
 //! Client-side manifest storage and I/O shared by filtered scan views.
 //! The caller's planning lock protects publication; delete I/O runs outside it.
@@ -20,7 +21,9 @@ public:
 	void LoadManifestList() DUCKDB_REQUIRES(lock);
 	void StartDataManifestScan(const vector<bool> &matching_manifests, idx_t filter_count) DUCKDB_REQUIRES(lock);
 	void ReadDeleteManifests(const vector<idx_t> &manifest_indexes, idx_t filter_count);
-	vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes) DUCKDB_REQUIRES(lock);
+	vector<IcebergDeleteFileReference> GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+	                                                  const IcebergManifestEntry &data_entry,
+	                                                  const IcebergManifestFile &data_manifest) DUCKDB_REQUIRES(lock);
 	bool TryGetNextBatch(IcebergDataViewCursor &cursor) DUCKDB_REQUIRES(lock);
 	void FinishScanTasks() DUCKDB_REQUIRES(lock);
 	const vector<IcebergManifestListEntry> &DataManifests() DUCKDB_REQUIRES(lock);
@@ -39,6 +42,8 @@ private:
 	bool manifest_list_loaded DUCKDB_GUARDED_BY(lock) = false;
 	bool data_manifest_scan_started DUCKDB_GUARDED_BY(lock) = false;
 
+	//! One immutable index per fully published manifest, shared by filtered views of this snapshot.
+	unordered_map<idx_t, unique_ptr<IcebergDeleteManifestIndex>> delete_indexes DUCKDB_GUARDED_BY(lock);
 	vector<IcebergManifestListEntry> committed_delete_manifests DUCKDB_GUARDED_BY(lock);
 	vector<reference<const IcebergManifestListEntry>> transaction_delete_manifests DUCKDB_GUARDED_BY(lock);
 	vector<shared_ptr<IcebergDeleteManifestLoadState>> delete_manifest_loads DUCKDB_GUARDED_BY(delete_manifest_lock);

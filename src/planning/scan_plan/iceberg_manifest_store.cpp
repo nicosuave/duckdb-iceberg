@@ -1,6 +1,8 @@
 #include "planning/scan_plan/iceberg_manifest_store.hpp"
 
 #include "common/iceberg_utils.hpp"
+#include "core/expression/iceberg_predicate_stats.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/parallel/task_executor.hpp"
@@ -10,6 +12,7 @@
 #include "planning/metadata_io/manifest_list/iceberg_manifest_list_reader.hpp"
 
 #include <condition_variable>
+#include <algorithm>
 
 namespace duckdb {
 
@@ -34,6 +37,155 @@ struct IcebergDeleteManifestLoadState {
 	vector<idx_t> manifest_indexes;
 	vector<IcebergManifestListEntry> manifests;
 	shared_ptr<IcebergManifestScanningState> scan_state;
+};
+
+//! Candidate selection only: the planner still checks provider assignments, partition equality and filters.
+//! A manifest is immutable after publication. Building indexes separately allows later manifest loads
+//! to become visible without rebuilding or freezing a scan-wide list of delete files.
+struct IcebergDeleteManifestIndex {
+	struct SequencedEntry {
+		sequence_number_t sequence;
+		idx_t entry_idx;
+	};
+	using Entries = vector<SequencedEntry>;
+
+	static optional<string> ReferencedPath(const IcebergDataFile &file) {
+		if (file.referenced_data_file) {
+			return file.referenced_data_file;
+		}
+		auto lower = file.lower_bounds.find(MultiFileReader::DELETE_FILE_PATH_FIELD_ID);
+		auto upper = file.upper_bounds.find(MultiFileReader::DELETE_FILE_PATH_FIELD_ID);
+		if (lower == file.lower_bounds.end() || upper == file.upper_bounds.end() || lower->second.IsNull() ||
+		    upper->second.IsNull() || lower->second.type().id() != LogicalTypeId::BLOB ||
+		    upper->second.type().id() != LogicalTypeId::BLOB || lower->second != upper->second) {
+			return nullopt;
+		}
+		// Equal filename bounds prove a single target even for v2 files without referenced_data_file.
+		// Unequal (including truncated) bounds must remain in the partition/sequence fallback.
+		try {
+			auto bounds = IcebergPredicateStats::DeserializeBounds(lower->second, upper->second, "file_path",
+			                                                       LogicalType::VARCHAR);
+			return bounds.lower_bound->GetValue<string>();
+		} catch (std::exception &) {
+			return nullopt;
+		}
+	}
+
+	static optional<hash_t> PartitionHash(const IcebergDataFile &file, const IcebergManifestFile &manifest,
+	                                      const IcebergTableMetadata &metadata) {
+		auto spec = metadata.partition_specs.find(manifest.partition_spec_id);
+		if (spec == metadata.partition_specs.end()) {
+			return nullopt;
+		}
+		if (spec->second.IsUnpartitioned()) {
+			return 0;
+		}
+		hash_t hash = 0;
+		for (auto &field : spec->second.fields) {
+			const Value *value = nullptr;
+			for (auto &partition : file.partition_info) {
+				if (partition.field_id == field.partition_field_id) {
+					value = &partition.value;
+					break;
+				}
+			}
+			auto column = metadata.FindColumnByFieldId(NumericCast<int32_t>(field.source_id));
+			if (!value || !column) {
+				return nullopt;
+			}
+			// Normalize promoted source types before hashing. Missing or unconvertible metadata
+			// falls back to sequence-only selection. Hash collisions only add candidates.
+			try {
+				auto type = field.transform.GetSerializedType(column->type);
+				auto value_hash = value->IsNull() ? hash_t(0) : value->DefaultCastAs(type).Hash();
+				hash = hash * 31 + value_hash;
+			} catch (std::exception &) {
+				return nullopt;
+			}
+		}
+		return hash;
+	}
+
+	IcebergDeleteManifestIndex(const IcebergManifestListEntry &manifest, const IcebergTableMetadata &metadata) {
+		auto &entries = manifest.GetManifestEntries();
+		for (idx_t entry_idx = 0; entry_idx < entries.size(); entry_idx++) {
+			auto &entry = entries[entry_idx];
+			if (entry.status == IcebergManifestEntryStatusType::DELETED) {
+				continue;
+			}
+			entry_count++;
+			if (entry.data_file.content != IcebergManifestEntryContentType::POSITION_DELETES) {
+				// Equality deletes keep their strict sequence comparison and statistics pruning
+				// in the authoritative applicability check.
+				other_entries.push_back(entry_idx);
+				continue;
+			}
+			SequencedEntry indexed {entry.GetSequenceNumber(manifest.file), entry_idx};
+			auto path = ReferencedPath(entry.data_file);
+			if (path) {
+				by_path[*path].push_back(indexed);
+			} else {
+				auto hash = PartitionHash(entry.data_file, manifest.file, metadata);
+				if (hash) {
+					by_partition[*hash].push_back(indexed);
+				} else {
+					fallback_entries.push_back(indexed);
+				}
+			}
+		}
+		for (auto &bucket : by_path) {
+			Sort(bucket.second);
+		}
+		for (auto &bucket : by_partition) {
+			Sort(bucket.second);
+		}
+		Sort(fallback_entries);
+	}
+
+	vector<idx_t> Lookup(const IcebergManifestEntry &data_entry, const IcebergManifestFile &data_manifest,
+	                     const IcebergManifestFile &delete_manifest, const IcebergTableMetadata &metadata) const {
+		vector<idx_t> result = other_entries;
+		auto sequence = data_entry.GetSequenceNumber(data_manifest);
+		auto path = by_path.find(data_entry.data_file.file_path);
+		if (path != by_path.end()) {
+			Append(path->second, sequence, result);
+		}
+		auto hash = PartitionHash(data_entry.data_file, delete_manifest, metadata);
+		if (hash) {
+			auto partition = by_partition.find(*hash);
+			if (partition != by_partition.end()) {
+				Append(partition->second, sequence, result);
+			}
+		} else {
+			for (auto &partition : by_partition) {
+				Append(partition.second, sequence, result);
+			}
+		}
+		Append(fallback_entries, sequence, result);
+		return result;
+	}
+
+	static void Sort(Entries &entries) {
+		std::sort(entries.begin(), entries.end(), [](const SequencedEntry &left, const SequencedEntry &right) {
+			return left.sequence < right.sequence;
+		});
+	}
+
+	static void Append(const Entries &entries, sequence_number_t sequence, vector<idx_t> &result) {
+		// Positional deletes apply at equal sequence numbers, unlike equality deletes.
+		auto start = std::lower_bound(
+		    entries.begin(), entries.end(), sequence,
+		    [](const SequencedEntry &entry, sequence_number_t number) { return entry.sequence < number; });
+		for (; start != entries.end(); ++start) {
+			result.push_back(start->entry_idx);
+		}
+	}
+
+	idx_t entry_count = 0;
+	vector<idx_t> other_entries;
+	unordered_map<string, Entries> by_path;
+	unordered_map<hash_t, Entries> by_partition;
+	Entries fallback_entries;
 };
 
 namespace {
@@ -354,51 +506,44 @@ void IcebergManifestStore::ReadDeleteManifests(const vector<idx_t> &manifest_ind
 	}
 }
 
-vector<IcebergDeleteFileReference> IcebergManifestStore::GetDeleteFiles(const vector<idx_t> &manifest_indexes) {
+vector<IcebergDeleteFileReference> IcebergManifestStore::GetDeleteFiles(const vector<idx_t> &manifest_indexes,
+                                                                        const IcebergManifestEntry &data_entry,
+                                                                        const IcebergManifestFile &data_manifest) {
 	vector<IcebergDeleteFileReference> result;
 	auto committed_manifest_count = committed_delete_manifests.size();
 	auto total_manifest_count = committed_manifest_count + transaction_delete_manifests.size();
+	idx_t indexed_entries = 0;
+	idx_t candidates = 0;
 	for (auto manifest_idx : manifest_indexes) {
 		if (manifest_idx >= total_manifest_count) {
 			throw InternalException("Selected delete manifest index %llu is out of bounds", manifest_idx);
 		}
-
-		if (manifest_idx < committed_manifest_count) {
-			auto &manifest_list_entry = committed_delete_manifests[manifest_idx];
-			if (!manifest_list_entry.HasManifestEntries()) {
-				throw InternalException("Selected delete manifest %llu was not loaded", manifest_idx);
+		auto &manifest = manifest_idx < committed_manifest_count
+		                     ? committed_delete_manifests[manifest_idx]
+		                     : transaction_delete_manifests[manifest_idx - committed_manifest_count].get();
+		if (!manifest.HasManifestEntries()) {
+			throw InternalException("Selected delete manifest %llu was not loaded", manifest_idx);
+		}
+		auto &index = delete_indexes[manifest_idx];
+		if (!index) {
+			index = make_uniq<IcebergDeleteManifestIndex>(manifest, context.metadata);
+		}
+		auto entries = index->Lookup(data_entry, data_manifest, manifest.file, context.metadata);
+		indexed_entries += index->entry_count;
+		candidates += entries.size();
+		for (auto entry_idx : entries) {
+			auto &entry = manifest.GetManifestEntries()[entry_idx];
+			// Transaction invalidation is checked at lookup, never frozen into the index.
+			if (context.transaction_data && context.transaction_data->IsFileInvalidated(
+			                                    {entry.data_file.file_path, entry.data_file.content_offset})) {
+				continue;
 			}
-			auto &manifest_entries = manifest_list_entry.GetManifestEntries();
-			for (idx_t entry_idx = 0; entry_idx < manifest_entries.size(); entry_idx++) {
-				auto &manifest_entry = manifest_entries[entry_idx];
-				if (manifest_entry.status == IcebergManifestEntryStatusType::DELETED) {
-					continue;
-				}
-				if (context.transaction_data &&
-				    context.transaction_data->IsFileInvalidated(
-				        {manifest_entry.data_file.file_path, manifest_entry.data_file.content_offset})) {
-					continue;
-				}
-				result.push_back({manifest_idx, entry_idx});
-			}
-		} else {
-			auto transaction_idx = manifest_idx - committed_manifest_count;
-			auto &manifest_list_entry = transaction_delete_manifests[transaction_idx].get();
-			auto &manifest_entries = manifest_list_entry.GetManifestEntries();
-			for (idx_t entry_idx = 0; entry_idx < manifest_entries.size(); entry_idx++) {
-				auto &manifest_entry = manifest_entries[entry_idx];
-				if (manifest_entry.status == IcebergManifestEntryStatusType::DELETED) {
-					continue;
-				}
-				if (context.transaction_data &&
-				    context.transaction_data->IsFileInvalidated(
-				        {manifest_entry.data_file.file_path, manifest_entry.data_file.content_offset})) {
-					continue;
-				}
-				result.push_back({manifest_idx, entry_idx});
-			}
+			result.push_back({manifest_idx, entry_idx});
 		}
 	}
+	DUCKDB_LOG(context.context, IcebergLogType,
+	           "Iceberg metadata phase=delete_index_lookup indexed_entries=%llu candidates=%llu", indexed_entries,
+	           candidates);
 	return result;
 }
 
