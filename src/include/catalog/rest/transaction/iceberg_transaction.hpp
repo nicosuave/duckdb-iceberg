@@ -96,6 +96,7 @@ public:
 	                                                       IcebergTableStatus status);
 	IcebergTransactionTableState &GetOrCreateTransactionTableState(const IcebergTable &table);
 	IcebergTransactionTableState &SetLatestTableState(const string &table_key, IcebergTableStatus status);
+	void RetainCatalogTable(const string &table_key, shared_ptr<IcebergTable> table);
 	bool StartedBefore(timestamp_ms_t timestamp_ms) const;
 	IcebergTransactionAlterUpdate &GetOrCreateAlter();
 	IcebergTable &DeleteTable(IcebergTable &table);
@@ -136,6 +137,8 @@ public:
 	unordered_map<string, shared_ptr<IcebergSchemaEntry>> created_schemas;
 	//! Tables referenced by this transaction that have to stay alive for the duration of the transaction.
 	unordered_map<string, shared_ptr<IcebergTable>> tables;
+	//! Older catalog generations can still be referenced by a bound table function in this transaction.
+	vector<shared_ptr<IcebergTable>> retired_tables;
 	//! The visible state of every resolved table in this transaction.
 	unordered_map<string, IcebergTransactionTableState> current_table_data;
 	//! Declared after the schema and table states so update references are destroyed before the referenced states.

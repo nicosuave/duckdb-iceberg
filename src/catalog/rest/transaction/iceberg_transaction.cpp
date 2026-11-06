@@ -77,6 +77,14 @@ IcebergTransaction::IcebergTransaction(IcebergCatalog &ic_catalog, TransactionMa
 
 IcebergTransaction::~IcebergTransaction() = default;
 
+void IcebergTransaction::RetainCatalogTable(const string &table_key, shared_ptr<IcebergTable> table) {
+	auto &current = tables[table_key];
+	if (current && current.get() != table.get()) {
+		retired_tables.push_back(std::move(current));
+	}
+	current = std::move(table);
+}
+
 void IcebergTransaction::Start() {
 }
 
